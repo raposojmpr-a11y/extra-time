@@ -1,0 +1,113 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""balance — how much is left on each agent's account, without spending tokens.
+Usage: balance [claude|codex|gemini ...] [--json] [--cache-min N]
+  Claude: opens Claude Code in a hidden tmux session and reads the /usage screen (local command, 0 tokens, ~15 s).
+  Codex:  reads the rate_limits Codex itself saved in its latest session (instant; valid as of that call).
+  Gemini: not measured yet (free daily plan).
+Saves the result to ~/shared/balance.json — 'delegate' uses it to pass the armband BEFORE the limit.
+Inspired by the /usage probing approach of the selftalk project.
+"""
+import glob, json, os, re, subprocess, sys, time, datetime
+
+TH = os.environ.get("SQUAD_HOME", "/data/data/com.termux/files/home")
+TP = os.environ.get("SQUAD_PREFIX", "/data/data/com.termux/files/usr")
+CACHE = f"{TH}/shared/balance.json"
+TMUX = f"{TP}/bin/tmux"
+SOCK = ["-L", "balance-probe"]
+IN_UBUNTU = os.environ.get("container") == "proot-distro"
+
+def now(): return datetime.datetime.now(datetime.timezone.utc)
+
+def claude():
+    def tm(*a): return subprocess.run([TMUX, *SOCK, *a], capture_output=True, text=True).stdout
+    def screen(): return tm("capture-pane", "-p", "-t", "p")
+    inner = "cd /root/.cache/balance-probe && /root/.local/bin/claude"
+    cmd = (f"env HOME=/root TERM=xterm-256color bash -c '{inner}'" if IN_UBUNTU
+           else f"proot-distro login ubuntu -- env HOME=/root TERM=xterm-256color bash -c 'mkdir -p /root/.cache/balance-probe; {inner}'")
+    if IN_UBUNTU: os.makedirs("/root/.cache/balance-probe", exist_ok=True)
+    subprocess.run([TMUX, *SOCK, "kill-server"], capture_output=True)
+    tm("new-session", "-d", "-x", "120", "-y", "45", "-s", "p", cmd)
+    try:
+        for _ in range(40):                       # wait for the UI
+            time.sleep(0.5); s = screen()
+            if "trust this folder" in s:           # dedicated empty folder: accept once (the home folder never stores trust)
+                tm("send-keys", "-t", "p", "Down"); time.sleep(0.4); tm("send-keys", "-t", "p", "Enter"); time.sleep(3)
+            elif "shortcuts" in s or "❯" in s or "> " in s: break
+        time.sleep(1.5)
+        tm("send-keys", "-t", "p", "/usage"); time.sleep(1); tm("send-keys", "-t", "p", "Enter")
+        s = ""
+        for _ in range(30):
+            time.sleep(0.5); s = screen()
+            if "Current week" in s and s.count("% used") >= 2: break
+        tm("send-keys", "-t", "p", "Escape")
+    finally:
+        subprocess.run([TMUX, *SOCK, "kill-server"], capture_output=True)
+    def block(title):
+        m = re.search(re.escape(title) + r".*?(\d+)% used\s*\n\s*Resets ([^\n]+)", s, re.S)
+        return (int(m.group(1)), m.group(2).strip()) if m else (None, None)
+    sp, sr = block("Current session"); wp, wr = block("Current week")
+    if sp is None: return {"error": "could not read the /usage screen"}
+    return {"session_pct": sp, "session_resets": sr, "week_pct": wp, "week_resets": wr, "source": "/usage"}
+
+def codex():
+    fs = glob.glob(f"{TH}/.codex/sessions/**/*.jsonl", recursive=True)
+    if not fs: return {"error": "no Codex sessions found"}
+    f = max(fs, key=os.path.getmtime)
+    rl = None
+    for line in open(f, errors="replace"):
+        if '"rate_limits"' not in line: continue
+        try:
+            def find(o):
+                if isinstance(o, dict):
+                    if "rate_limits" in o and isinstance(o["rate_limits"], dict): return o["rate_limits"]
+                    for v in o.values():
+                        r = find(v)
+                        if r: return r
+                elif isinstance(o, list):
+                    for v in o:
+                        r = find(v)
+                        if r: return r
+            rl = find(json.loads(line)) or rl
+        except Exception: pass
+    if not rl: return {"error": "no rate_limits in the latest session"}
+    def window(k):
+        j = rl.get(k) or {}
+        pct, ra = j.get("used_percent"), j.get("resets_at")
+        if ra and ra < time.time(): pct = 0.0          # window already reset since the last call
+        return pct, (datetime.datetime.fromtimestamp(ra).strftime("%d/%m %H:%M") if ra else None)
+    sp, sr = window("primary"); wp, wr = window("secondary")
+    measured = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime("%d/%m %H:%M")
+    return {"session_pct": sp, "session_resets": sr, "week_pct": wp, "week_resets": wr,
+            "source": f"last call ({measured})"}
+
+def gemini():
+    return {"error": "not measured (free plan; no API key yet)" if not os.path.exists(f"{TH}/.gemini/.env")
+            else "not measured automatically (free daily plan)"}
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    which = args or ["claude", "codex", "gemini"]
+    cache_min = 0
+    if "--cache-min" in sys.argv:
+        cache_min = float(sys.argv[sys.argv.index("--cache-min") + 1]); which = [a for a in which if not a.replace(".", "").isdigit()]
+    try: data = json.load(open(CACHE))
+    except Exception: data = {}
+    for a in which:
+        e = data.get(a, {})
+        fresh = e.get("measured_at") and (now() - datetime.datetime.fromisoformat(e["measured_at"])).total_seconds() < cache_min * 60
+        if not fresh:
+            r = {"claude": claude, "codex": codex, "gemini": gemini}[a]()
+            r["measured_at"] = now().isoformat(timespec="seconds"); data[a] = r
+    with open(CACHE, "w") as f: json.dump(data, f, indent=1)
+    if "--json" in sys.argv:
+        print(json.dumps({a: data[a] for a in which}, ensure_ascii=False)); return
+    ID = {"claude": "🟠 Claude", "codex": "🟢 Codex ", "gemini": "🔵 Gemini"}
+    for a in which:
+        r = data[a]
+        if "error" in r: print(f"{ID[a]}  —  {r['error']}"); continue
+        def bar(p): p = p or 0; n = int(round(p / 10)); return "█" * n + "░" * (10 - n)
+        warn = " ⚠️" if (r.get("session_pct") or 0) >= 80 or (r.get("week_pct") or 0) >= 80 else ""
+        print(f"{ID[a]}  session {bar(r['session_pct'])} {r['session_pct']:>5.0f}% (resets {r['session_resets']})"
+              f" · week {r['week_pct']:>3.0f}% (resets {r['week_resets']}){warn}   [{r['source']}]")
+
+main()

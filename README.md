@@ -19,6 +19,8 @@ It runs on your **regular subscriptions** (Claude Pro, ChatGPT, free Gemini) thr
   - logs input/output/cache tokens, duration and status to `usage.csv`;
   - visual identity of who is replying: 🟠 Claude · 🟢 Codex · 🔵 Gemini.
 - **Captain's armband** 🎽 — every task type has a chain (captain → vice → third). If the captain hits its usage limit, the request automatically goes to the next agent, and the exhausted one sits "on the bench" for a few hours so no calls are wasted retrying it.
+- **`balance`** — how much is left on each account **without spending a single token**: reads Claude Code's `/usage` screen in a hidden tmux session and the rate limits Codex saves after each call.
+- **Proactive armband** — `delegate` skips an agent that is ≥90% of its 5-hour window (or ≥98% of the week) *before* calling it, so the switch happens before the wall, not after.
 - **`usage-report`** — usage per agent and task type, so you can tune routing rules with real data over time.
 
 ## Tested architecture
@@ -52,19 +54,22 @@ delegate auto  -t research "What is the latest stable llama.cpp release?"
 delegate --status            # who is on the bench
 delegate --release codex     # put an agent back manually
 usage-report 7               # usage for the last 7 days
+balance                      # what's left on each account (0 tokens)
 ```
 Task types: `research · termux · network · code · review · docs · other`.
 
 In a chat with any agent, say **"call the squad"** when the CLI warns you are close to your usage limit: the agent saves the work in progress and hands it to the next one.
 
 ## Honest limitations
-- There is no official API for the remaining balance of these subscriptions. EXTRA TIME currently detects limits from error-message text, and the "bench" time is an estimate. (Other projects probe Claude Code's `/usage` screen through tmux to switch *before* the limit — on the roadmap here.)
+- There is no official API for the remaining balance of these subscriptions. `balance` reads Claude Code's `/usage` screen (a UI that may change between versions) and Codex's saved rate limits (accurate as of its last call). Gemini is not measured yet; for it, limits are still detected from error text and the "bench" time is an estimate.
+- To read `/usage`, `balance` runs Claude Code in a dedicated empty folder (`~/.cache/balance-probe`) and accepts the folder-trust prompt there once.
 - An interactive agent that runs out of tokens cannot pass the armband by itself — that is why "call the squad" and the *Work in progress* section exist.
 - Gemini CLI needs `TERMUX_VERSION` set when called from PRoot (`delegate` handles it).
 - Tested on one ARM64 Android phone (Android 16). Other devices may need tweaks.
 
 ## Roadmap
-- [ ] Proactive switch before the limit (probe `/usage` / `/status`), not only after it.
+- [x] Proactive switch before the limit (`balance` + threshold in `delegate`).
+- [ ] Measure Gemini's free-tier usage.
 - [ ] Regular Linux / macOS / WSL support (move from the phone to a home server).
 - [ ] More players on the bench: local models (llama.cpp / Ollama), Aider, OpenCode.
 - [ ] Per-CLI limit detection tests.
@@ -76,7 +81,7 @@ Multi-agent orchestration is a growing space — check these out too:
 - [coding_agent_orchestrator](https://github.com/manikDH/coding_agent_orchestrator) — Claude Code as a manager of several agent CLIs.
 - [cli-orchestrator-mcp](https://github.com/lleontor705/cli-orchestrator-mcp) — MCP server with retries, circuit breaker and fallback.
 
-What EXTRA TIME focuses on: running the whole squad **on an Android phone**, a **token-lean shared memory**, the **bench**, and a **usage log** that you use to tune routing over time.
+What EXTRA TIME focuses on: running the whole squad **on an Android phone**, a **token-lean shared memory**, the **bench**, a **usage log** that you use to tune routing over time, and **zero-token balance checks** for both Claude and Codex.
 
 ## Contributing
 Ideas, bug reports and pull requests are very welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Especially wanted:

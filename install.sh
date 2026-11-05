@@ -15,7 +15,7 @@ else CLAUDE_DIR=$TP/var/lib/proot-distro/containers/ubuntu/rootfs/root/.claude; 
 
 echo "→ Shared memory in $SH"
 mkdir -p "$SH/topics" "$SH/archive" "$SH/bin"
-for f in delegate usage-report; do
+for f in delegate usage-report balance; do
   if [ -f "$SH/bin/$f" ] && ! cmp -s "$HERE/bin/$f" "$SH/bin/$f"; then
     cp "$SH/bin/$f" "$SH/bin/$f.old"; echo "  (previous version kept as $SH/bin/$f.old)"; fi
   install -m 755 "$HERE/bin/$f" "$SH/bin/$f"

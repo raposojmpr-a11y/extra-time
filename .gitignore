@@ -3,3 +3,4 @@ accounts-state.json
 *.old
 __pycache__/
 .env
+balance.json

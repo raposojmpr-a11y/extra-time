@@ -26,6 +26,7 @@ Read by every agent at startup. Details live in `~/shared/topics/<topic>.md` —
 ## Captain's armband
 - **Captain (coordinates):** Claude → Codex → Gemini. If the user opens another agent because the captain is out of tokens, that agent takes over: read "Work in progress" and continue.
 - `delegate` automatically passes the request to the next agent in the chain when one hits its limit, and puts it "on the bench" for a few hours (`delegate --status`).
+- Check your own balance (`~/shared/bin/balance <agent>`, 0 tokens) at session start and before long tasks: ≥80% warn the user; ≥90% suggest "call the squad".
 - **"call the squad"** (the user saw the CLI's usage-limit warning): the captain updates "Work in progress", hands the task to the next agent via `delegate` and, if it is long, tells the user which agent to open.
 
 ## Work in progress (update at every milestone)

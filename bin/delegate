@@ -188,10 +188,25 @@ PY
   return $RC
 }
 
-PREV=""
+# Proactive armband: an agent above the usage threshold (via 'balance', 0 tokens) is skipped if a substitute exists
+near_limit() {
+  local L=${DELEGATE_THRESHOLD:-90}
+  "$TH/shared/bin/balance" "$1" --json --cache-min 30 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('$1', {})
+s, w = d.get('session_pct') or 0, d.get('week_pct') or 0
+print(f'{s:.0f}% session / {w:.0f}% week')
+sys.exit(0 if (s >= $L or w >= 98) else 1)"
+}
+
+PREV=""; LEFT=$(echo $ORDER | wc -w)
 for AG in $ORDER; do
+  LEFT=$((LEFT - 1))
   if ! state_py available "$AG"; then
     echo "[delegate] $AG is on the bench (limit reached) — skipping" >&2; PREV=$AG; continue
+  fi
+  if [ $FALLBACK = 1 ] && [ $LEFT -gt 0 ] && USE=$(near_limit "$AG"); then
+    echo "[delegate] 🔁 $AG almost out of tokens ($USE) — proactive armband" >&2; PREV=$AG; continue
   fi
   [ -n "$PREV" ] && echo "[delegate] 🔁 armband passes from $PREV to $AG" >&2
   run_agent "$AG" "$PREV"; RC=$?
