@@ -1,0 +1,209 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# delegate — the single way for one agent to call another, with usage logging and the "captain's armband" (automatic fallback)
+# Usage: delegate <codex|gemini|claude|auto> [-t type] [-w] [-n] "request"
+#        delegate --status          show which agents are "on the bench" (hit their usage limit)
+#        delegate --release <agent> put an agent back in the game manually
+#   -t type : research|termux|network|code|review|docs|other (default: other)
+#   -w      : allow writes (default: read-only)
+#   -n      : no fallback (if the agent fails, do not pass to the next one)
+#   auto    : pick the captain from the chain for the task type
+#   DELEGATE_FROM=<agent> identifies the caller (default: claude inside proot Ubuntu, termux otherwise)
+set -uo pipefail
+TH=${SQUAD_HOME:-/data/data/com.termux/files/home}
+TP=${SQUAD_PREFIX:-/data/data/com.termux/files/usr}
+LOG=$TH/shared/usage.csv
+STATE=$TH/shared/accounts-state.json
+
+# Captaincy chains per task type (captain first). Tune them during usage reviews.
+chain() {
+  case $1 in
+    research|docs)      echo "gemini claude codex" ;;
+    termux|network|code) echo "codex claude gemini" ;;
+    review)             echo "codex gemini claude" ;;
+    *)                  echo "claude codex gemini" ;;
+  esac
+}
+# Hours "on the bench" after hitting a limit (estimates: ~5 h windows for Claude Pro and ChatGPT; free Gemini is daily)
+bench_hours() { case $1 in claude) echo 5 ;; codex) echo 5 ;; gemini) echo 12 ;; esac; }
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+
+# --- Account state (who is on the bench) ---
+state_py() { python3 - "$STATE" "$@" <<'PY'
+import sys, json, fcntl, datetime
+path, action = sys.argv[1], sys.argv[2]
+now = datetime.datetime.now()
+open(path, "a").close()
+with open(path, "r+") as f:
+    fcntl.flock(f, fcntl.LOCK_EX)
+    try: d = json.loads(f.read() or "{}")
+    except Exception: d = {}
+    if action == "bench":            # bench <agent> <hours>
+        ag, h = sys.argv[3], float(sys.argv[4])
+        d[ag] = {"until": (now + datetime.timedelta(hours=h)).isoformat(timespec="minutes"),
+                 "since": now.isoformat(timespec="minutes")}
+    elif action == "release":
+        d.pop(sys.argv[3], None)
+    elif action == "available":      # exit 0 = available
+        e = d.get(sys.argv[3])
+        sys.exit(0 if not e or datetime.datetime.fromisoformat(e["until"]) <= now else 1)
+    elif action == "show":
+        active = {k: v for k, v in d.items() if datetime.datetime.fromisoformat(v["until"]) > now}
+        if not active: print("All agents available.")
+        for k, v in active.items(): print(f"{k}: on the bench since {v['since']} until ~{v['until']}")
+    f.seek(0); f.truncate(); f.write(json.dumps(d, indent=1))
+PY
+}
+
+case ${1:-} in
+  --status)  state_py show; exit 0 ;;
+  --release) [ $# -ge 2 ] || usage; state_py release "$2"; echo "$2 is back in the game."; exit 0 ;;
+esac
+
+[ $# -ge 1 ] || usage
+DEST=$1; shift
+case $DEST in codex|gemini|claude|auto) ;; *) usage ;; esac
+TYPE=other; MODE=read-only; FALLBACK=1
+while getopts "t:wnh" o; do case $o in t) TYPE=$OPTARG ;; w) MODE=write ;; n) FALLBACK=0 ;; *) usage ;; esac; done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || usage
+REQUEST="$*"
+
+IN_UBUNTU=0; [ "${container:-}" = proot-distro ] && IN_UBUNTU=1
+FROM=${DELEGATE_FROM:-$([ $IN_UBUNTU = 1 ] && echo claude || echo termux)}
+
+# Try order: requested agent first, then the rest of the chain; never the caller itself
+ORDER=""
+[ "$DEST" != auto ] && ORDER=$DEST
+[ "$DEST" = auto ] || [ $FALLBACK = 1 ] && for a in $(chain "$TYPE"); do case " $ORDER " in *" $a "*) ;; *) ORDER="$ORDER $a" ;; esac; done
+ORDER=$(for a in $ORDER; do [ "$a" != "$FROM" ] && echo -n "$a "; done)
+[ -n "$ORDER" ] || { echo "[delegate] no agent available to call" >&2; exit 2; }
+
+termux_env() { env HOME=$TH PREFIX=$TP TMPDIR=$TP/tmp TERMUX_VERSION=${TERMUX_VERSION:-0.118.3} PATH=$TP/bin:/usr/bin:/bin "$@"; }
+
+# Run one agent. Exit code: 0 ok · 3 limit · 1 error
+run_agent() {
+  local AG=$1 PREV=$2 TMP RC SECS PROMPT NOTE=""
+  [ -n "$PREV" ] && NOTE="
+[Armband: you are replacing $PREV, which is out of tokens/unavailable. If the task is long, log progress in ~/shared/topics/ for whoever continues.]"
+  PROMPT="[Request from $FROM via 'delegate' | type: $TYPE | mode: $MODE]$NOTE
+Do only what is asked. Be concise: do not restate the request, no intros or closing summaries. Read only the shared-memory topic you need.$([ $MODE = read-only ] && echo ' Do not modify any files.')
+
+$REQUEST"
+  TMP=$(mktemp -d "$TP/tmp/delegate.XXXXXX") || return 1
+  SECONDS=0
+  if [ -n "${DELEGATE_SIMULATE_LIMIT:-}" ] && [ "$AG" = "$DELEGATE_SIMULATE_LIMIT" ]; then
+    echo "simulated rate limit reached" > "$TMP/err"; : > "$TMP/out"; RC=1   # testing only
+  else case $AG in
+    codex)
+      local SB=read-only; [ $MODE = write ] && SB=workspace-write
+      (cd "$TH" && termux_env codex exec --json --skip-git-repo-check --sandbox $SB \
+          -o "$TMP/resp.txt" "$PROMPT") > "$TMP/out" 2> "$TMP/err"; RC=$? ;;
+    gemini)
+      local AM=plan; [ $MODE = write ] && AM=auto_edit
+      (cd "$TH" && termux_env gemini -p "$PROMPT" --output-format json --approval-mode $AM) \
+          > "$TMP/out" 2> "$TMP/err"; RC=$? ;;
+    claude)
+      local PM=plan; [ $MODE = write ] && PM=acceptEdits
+      if [ $IN_UBUNTU = 1 ]; then
+        (cd /root && /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT") > "$TMP/out" 2> "$TMP/err"; RC=$?
+      else
+        proot-distro login ubuntu -- /root/.local/bin/claude -p --output-format json --permission-mode $PM "$PROMPT" > "$TMP/out" 2> "$TMP/err"; RC=$?
+      fi ;;
+  esac; fi
+  SECS=$SECONDS
+  python3 - "$AG" "$TMP" "$RC" "$SECS" "$LOG" "$FROM" "$TYPE" "$MODE" "$REQUEST" "${PREV:--}" <<'PY'
+import sys, json, os, csv, re, datetime, fcntl
+dest, tmp, rc, secs, log, src, ttype, mode, request, prev = sys.argv[1:11]
+rc = int(rc)
+out = open(f"{tmp}/out", errors="replace").read()
+err = open(f"{tmp}/err", errors="replace").read()
+resp, tin, tout, tcache = "", 0, 0, 0
+try:
+    if dest == "codex":
+        if os.path.exists(f"{tmp}/resp.txt"):
+            resp = open(f"{tmp}/resp.txt", errors="replace").read()
+        for line in out.splitlines():
+            try: ev = json.loads(line)
+            except Exception: continue
+            u = ev.get("usage") if isinstance(ev, dict) else None
+            if isinstance(u, dict):
+                tin += u.get("input_tokens", 0); tout += u.get("output_tokens", 0)
+                tcache += u.get("cached_input_tokens", 0)
+            if not resp and ev.get("type") == "item.completed":
+                it = ev.get("item", {})
+                if it.get("type") == "agent_message": resp = it.get("text", "")
+    elif dest == "gemini":
+        d = json.loads(out[out.find("{"):]) if "{" in out else {}
+        resp = d.get("response", "") or ""
+        for m in (d.get("stats", {}).get("models", {}) or {}).values():
+            t = m.get("tokens", {})
+            tin += t.get("prompt", 0); tout += t.get("candidates", 0) + t.get("thoughts", 0)
+            tcache += t.get("cached", 0)
+    else:
+        d = json.loads(out[out.find("{"):]) if "{" in out else {}
+        resp = d.get("result", "") or ""
+        u = d.get("usage", {}) or {}
+        tcache = u.get("cache_read_input_tokens", 0)
+        tin = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0) + tcache
+        tout = u.get("output_tokens", 0)
+except Exception as e:
+    err += f"\n[delegate] could not parse output: {e}"
+text = (out + err).lower()
+failed = rc != 0 or not resp.strip()
+if failed and re.search(r"rate.?limit|quota|usage limit|limit reached|429|resource_exhausted|exceeded|too many requests", text):
+    status = "limit"
+elif failed:
+    status = "error"
+else:
+    status = "ok"
+try:
+    with open(log, "a", newline="") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)  # concurrent calls do not corrupt the CSV
+        w = csv.writer(f)
+        if f.tell() == 0:
+            w.writerow(["date","from","to","type","mode","tok_in","tok_out","tok_cache","seconds","status","summary","replaced"])
+        summary = re.sub(r"\s+", " ", request)[:80]
+        w.writerow([datetime.datetime.now().isoformat(timespec="seconds"), src, dest, ttype, mode, tin, tout, tcache, secs, status, summary, prev])
+except OSError as e:
+    print(f"[delegate] warning: could not write usage log ({e})", file=sys.stderr)
+# Visual identity of who is writing: 🟠 Claude · 🟢 Codex · 🔵 Gemini
+ID = {"claude": ("🟠", "CLAUDE", "38;5;208"), "codex": ("🟢", "CODEX", "32"), "gemini": ("🔵", "GEMINI", "34")}
+emo, name, color = ID[dest]
+c = (lambda s: f"\033[1;{color}m{s}\033[0m") if sys.stdout.isatty() else (lambda s: s)
+sub = f" · replacing {prev}" if prev != "-" else ""
+stats = f"{tin} in (cache {tcache}) · {tout} out · {secs}s"
+if status == "ok":
+    print(c(f"╭── {emo} {name} replies · {ttype} · {mode}{sub} ──"))
+    print(resp.strip())
+    print(c(f"╰── {emo} end {name} · {stats} ──"))
+else:
+    print(c(f"── {emo} {name} failed ({status}, code {rc}) ──"), file=sys.stderr)
+    print("\n".join((err or out).strip().splitlines()[-5:]), file=sys.stderr)
+    print(f"[delegate] {dest} · {stats} · {status}", file=sys.stderr)
+sys.exit({"ok": 0, "limit": 3}.get(status, 1))
+PY
+  RC=$?
+  rm -rf "$TMP"
+  return $RC
+}
+
+PREV=""
+for AG in $ORDER; do
+  if ! state_py available "$AG"; then
+    echo "[delegate] $AG is on the bench (limit reached) — skipping" >&2; PREV=$AG; continue
+  fi
+  [ -n "$PREV" ] && echo "[delegate] 🔁 armband passes from $PREV to $AG" >&2
+  run_agent "$AG" "$PREV"; RC=$?
+  [ $RC = 0 ] && exit 0
+  if [ $RC = 3 ]; then
+    state_py bench "$AG" "$(bench_hours "$AG")"
+    echo "[delegate] ⛔ $AG out of tokens → on the bench ~$(bench_hours "$AG") h" >&2
+  elif [ $MODE = write ]; then
+    echo "[delegate] $AG errored in write mode — not falling back (avoids duplicated changes)" >&2; exit 1
+  fi
+  [ $FALLBACK = 1 ] || exit 1
+  PREV=$AG
+done
+echo "[delegate] ❌ no agent in the chain could answer ($ORDER)" >&2
+exit 1

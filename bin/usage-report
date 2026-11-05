@@ -1,0 +1,80 @@
+#!/data/data/com.termux/files/usr/bin/python3
+"""usage-report — token usage summary for the agent squad.
+Usage: usage-report [days]   (default: 7)
+Sources: ~/shared/usage.csv (calls made via 'delegate') + Claude Code sessions (~/.claude/projects).
+"""
+import csv, glob, json, os, sys, datetime
+from collections import defaultdict
+
+TH = os.environ.get("SQUAD_HOME", "/data/data/com.termux/files/home")
+TP = os.environ.get("SQUAD_PREFIX", "/data/data/com.termux/files/usr")
+LOG = f"{TH}/shared/usage.csv"
+days = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+since = datetime.datetime.now() - datetime.timedelta(days=days)                       # local time (CSV)
+since_utc = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)  # Claude sessions (UTC)
+print(f"== Usage for the last {days} days (since {since:%Y-%m-%d}) ==\n")
+
+# 1) Calls between agents
+rows = []
+if os.path.exists(LOG):
+    with open(LOG) as f:
+        for r in csv.DictReader(f):
+            try:
+                if datetime.datetime.fromisoformat(r["date"]) >= since: rows.append(r)
+            except Exception: pass
+print(f"-- Calls between agents (delegate): {len(rows)}")
+if rows:
+    g = defaultdict(lambda: [0, 0, 0, 0, 0, 0])  # n, in, out, cache, secs, failures
+    for r in rows:
+        for key in [(r["to"], "TOTAL"), (r["to"], r["type"])]:
+            a = g[key]; a[0] += 1
+            a[1] += int(r["tok_in"] or 0); a[2] += int(r["tok_out"] or 0)
+            a[3] += int(r["tok_cache"] or 0); a[4] += int(r["seconds"] or 0)
+            a[5] += r["status"] != "ok"
+    print(f"{'agent':8} {'type':10} {'n':>3} {'in':>9} {'out':>8} {'cache':>8} {'avg/call':>9} {'s/call':>6} {'fails':>5}")
+    for (d, t), a in sorted(g.items(), key=lambda x: (x[0][0], x[0][1] != "TOTAL", x[0][1])):
+        n = a[0]
+        print(f"{d:8} {t:10} {n:>3} {a[1]:>9} {a[2]:>8} {a[3]:>8} {(a[1]+a[2])//n:>9} {a[4]//n:>6} {a[5]:>5}")
+    lim = [r for r in rows if r["status"] == "limit"]
+    if lim:
+        print(f"\n!! {len(lim)} call(s) hit an account limit: " + ", ".join(sorted({r['to'] for r in lim})))
+print()
+
+# 2) Claude Code sessions (direct use + coordination)
+roots = ["/root/.claude/projects", f"{TP}/var/lib/proot-distro/containers/ubuntu/rootfs/root/.claude/projects",
+         os.path.expanduser("~/.claude/projects")]
+files = []
+for r in roots:
+    if os.path.isdir(r): files = glob.glob(f"{r}/*/*.jsonl"); break
+seen, tot, sess = set(), defaultdict(int), set()
+for p in files:
+    try:
+        for line in open(p, errors="replace"):
+            try: e = json.loads(line)
+            except Exception: continue
+            m = e.get("message") or {}
+            u = m.get("usage") if isinstance(m, dict) else None
+            if not u: continue
+            try:
+                ts = datetime.datetime.fromisoformat(e.get("timestamp", "").replace("Z", "+00:00"))
+                if ts.tzinfo is None: ts = ts.replace(tzinfo=datetime.timezone.utc)
+            except Exception: continue
+            if ts < since_utc: continue
+            mid = m.get("id") or e.get("uuid")
+            if mid in seen: continue
+            seen.add(mid); sess.add(p)
+            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+                tot[k] += u.get(k, 0) or 0
+    except Exception: pass
+if files:
+    print(f"-- Claude Code (sessions): {len(sess)} session(s), {len(seen)} replies")
+    print(f"   new input {tot['input_tokens']} · cache write {tot['cache_creation_input_tokens']} · "
+          f"cache read {tot['cache_read_input_tokens']} · output {tot['output_tokens']}")
+else:
+    print("-- Claude Code: sessions not reachable from here")
+
+# 3) Fixed cost of the shared memory (loaded in every session of every agent)
+mem = f"{TH}/shared/MEMORY.md"
+if os.path.exists(mem):
+    b = os.path.getsize(mem)
+    print(f"\n-- Fixed cost: MEMORY.md = {b} bytes ≈ {b//4:.0f} tokens per session, per agent (target < ~1,000)")
